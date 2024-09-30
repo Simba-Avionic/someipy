@@ -127,20 +127,19 @@ class ServiceDiscoveryProtocol(ServiceDiscoverySubject, ServiceDiscoverySender):
             addr (Tuple[Union[str, Any], int]): The address of the sender.
         """
         # Ignore packets sent by the app itself
-        if addr[0] == self.interface_ip:
-            return
-
+        
+        # if addr[0] == self.interface_ip:
+        #     return
         # Ignore packets not sent to the SD port
         if addr[1] != self.sd_port:
             return
-
         someip_header = SomeIpHeader.from_buffer(data)
         if not someip_header.is_sd_header():
             return
 
         someip_sd_header = SomeIpSdHeader.from_buffer(data)
-
         for offered_service in extract_offered_services(someip_sd_header):
+            
             self._handle_offered_service(offered_service)
 
         for (
