@@ -45,7 +45,7 @@ pip3 install someipy
 
 ## Example Applications
 
-In the directory [example_apps](./example_apps/), examples including explanations, can be found for using the someipy library. In [temperature_msg.py](./example_apps/temperature_msg.py), a payload interface "TemperatureMsg" is defined, which can be serialized and deserialized. In [send_events.py](./example_apps/send_events.py), the service discovery and two services are instantiated. The "TemperatureMsg" is serialized and used as the payload for sending events.
+In the directory [example_apps](./example_apps/), examples including explanations, can be found for using the someipy library.
 
 ## Supported Features, Limitations and Deviations
 
@@ -56,19 +56,10 @@ The library is still under development. The current major limitations and deviat
 - Only unicast services are supported.
 - SOME/IP-TP is not supported.
 - IPv6 endpoints are not supported.
-- Session handling is supported only for SOME/IP-SD and not for SOME/IP messages transporting events or methods.
 - SOME/IP fields are not supported.
 
 ### Service Discovery
 
 - Configuration and load balancing options in SOME/IP SD messages are not supported.
-- TTL of Service Discovery entries is not checked yet.
-- The Initial Wait Phase and Repetition Phase of the Service Discovery specification are skipped. For simplification, the Main Phase is directly entered, i.e. SD Offer Entries are immediately sent cyclically.
-- Multiple Service Discovery entries are not packed together in a single SD message, which is sent via UDP.
-
-### De-/Serialization
-
-- Only fixed size arrays are supported. Dynamically sized arrays are not supported.
-- Optional length fields for SOME/IP arrays are not supported.
-- Strings are not supported yet.
-- Configuration of padding is not supported yet.
+- Stop subscribe message of notifications is not supported
+- The Initial Wait Phase and Repetition Phase of the Service Discovery specification are skipped. The Main Phase is directly entered, i.e. SD Offer Entries are immediately sent cyclically.

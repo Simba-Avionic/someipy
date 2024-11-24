@@ -1,29 +1,30 @@
 # Copyright (C) 2024 Christian H.
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
-from typing import Tuple
+from typing import Set, Tuple
 
 from someipy._internal.someip_message import SomeIpMessage
 from someipy.service import Service
 
 from someipy._internal.tcp_client_manager import TcpClientManager, TcpClientProtocol
-from someipy._internal.message_types import MessageType, ReturnCode
+from someipy._internal.message_types import MessageType
+from someipy._internal.return_codes import ReturnCode
 from someipy._internal.someip_sd_builder import (
+    build_stop_offer_service_sd_header,
     build_subscribe_eventgroup_ack_entry,
-    build_offer_service_sd_header,
     build_subscribe_eventgroup_ack_sd_header,
 )
 from someipy._internal.someip_header import SomeIpHeader
@@ -67,6 +68,11 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
     _subscribers: Subscribers
     _offer_timer: SimplePeriodicTimer
 
+    _handler_tasks: Set[asyncio.Task]
+    _is_running: bool
+
+    _session_id: int
+
     def __init__(
         self,
         service: Service,
@@ -90,6 +96,10 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
         self._subscribers = Subscribers()
         self._offer_timer = None
 
+        self._handler_tasks = set()
+        self._is_running = True
+        self._session_id = 0  # Starts from 1 to 0xFFFF
+
     def send_event(self, event_group_id: int, event_id: int, payload: bytes) -> None:
         """
         Sends an event to subscribers with the given event group ID, event ID, and payload.
@@ -109,15 +119,18 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
 
         self._subscribers.update()
 
+        # Session ID is a 16-bit value and should be incremented for each method call starting from 1
+        self._session_id = (self._session_id + 1) % 0xFFFF
+
         length = 8 + len(payload)
         someip_header = SomeIpHeader(
             service_id=self._service.id,
             method_id=event_id,
             length=length,
-            client_id=0x00,  # TODO
-            session_id=0x01,  # TODO
-            protocol_version=1,  # TODO
-            interface_version=1,  # TODO
+            client_id=0x00,
+            session_id=self._session_id,
+            protocol_version=1,
+            interface_version=self._service.major_version,
             message_type=MessageType.NOTIFICATION.value,
             return_code=0x00,
         )
@@ -132,6 +145,23 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
                     someip_header.to_buffer() + payload,
                     endpoint_to_str_int_tuple(sub.endpoint),
                 )
+
+    async def _handle_method_call(self, method_handler, dst_addr, header_to_return):
+        try:
+            result = await method_handler
+            header_to_return.message_type = result.message_type.value
+            header_to_return.return_code = result.return_code.value
+            payload_to_return = result.payload
+
+            # Update length in header to the correct length
+            header_to_return.length = 8 + len(payload_to_return)
+            self._someip_endpoint.sendto(
+                header_to_return.to_buffer() + payload_to_return, dst_addr
+            )
+        except asyncio.CancelledError:
+            get_logger(_logger_name).debug(
+                f"Method call for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X} was canceled"
+            )
 
     def someip_message_received(
         self, message: SomeIpMessage, addr: Tuple[str, int]
@@ -153,6 +183,10 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             - The protocol and interface version are not checked yet.
             - If the message type in the received header is not a request, a warning is logged.
         """
+
+        if not self._is_running:
+            return
+
         header = message.header
         payload_to_return = bytes()
         header_to_return = header
@@ -167,7 +201,7 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             )
 
         if header.service_id != self._service.id:
-            get_logger(_logger_name).warn(
+            get_logger(_logger_name).warning(
                 f"Unknown service ID received from {addr}: ID 0x{header.service_id:04X}"
             )
             header_to_return.message_type = MessageType.RESPONSE.value
@@ -175,8 +209,17 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             send_response()
             return
 
+        if header.interface_version != self._service.major_version:
+            get_logger(_logger_name).warning(
+                f"Unknown interface version received from {addr}: Version {header.interface_version}"
+            )
+            header_to_return.message_type = MessageType.RESPONSE.value
+            header_to_return.return_code = ReturnCode.E_WRONG_INTERFACE_VERSION.value
+            send_response()
+            return
+
         if header.method_id not in self._service.methods.keys():
-            get_logger(_logger_name).warn(
+            get_logger(_logger_name).warning(
                 f"Unknown method ID received from {addr}: ID 0x{header.method_id:04X}"
             )
             header_to_return.message_type = MessageType.RESPONSE.value
@@ -184,28 +227,33 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             send_response()
             return
 
-        # TODO: Test for protocol and interface version
-
-        if (
-            header.message_type == MessageType.REQUEST.value
-            and header.return_code == 0x00
-        ):
-            method_handler = self._service.methods[header.method_id].method_handler
-            success, payload_result = method_handler(message.payload, addr)
-            if not success:
-                header_to_return.message_type = MessageType.ERROR.value
-            else:
-                header_to_return.message_type = MessageType.RESPONSE.value
-                payload_to_return = payload_result
-
-            send_response()
-
-        else:
-            get_logger(_logger_name).warn(
+        if header.message_type != MessageType.REQUEST.value:
+            get_logger(_logger_name).warning(
                 f"Unknown message type received from {addr}: Type 0x{header.message_type:04X}"
             )
+            header_to_return.message_type = MessageType.RESPONSE.value
+            header_to_return.return_code = ReturnCode.E_WRONG_MESSAGE_TYPE.value
+            send_response()
+            return
 
-    def find_service_update(self):
+        if header.return_code == 0x00:
+            method_handler = self._service.methods[header.method_id].method_handler
+            coro = method_handler(message.payload, addr)
+
+            # If a method is called, do it in a separate task to allow for asynchronous processing inside
+            # method handlers
+            new_task = asyncio.create_task(
+                self._handle_method_call(coro, addr, header_to_return)
+            )
+            self._handler_tasks.add(new_task)
+            new_task.add_done_callback(self._handler_tasks.discard)
+
+        else:
+            get_logger(_logger_name).warning(
+                f"Wrong return type received from {addr}: Type 0x{header.return_code:02X}"
+            )
+
+    def handle_find_service(self):
         """
         Handle an SD find service entry. Not implemented yet.
 
@@ -217,7 +265,7 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
         # TODO: implement SD behaviour and send back offer
         pass
 
-    def offer_service_update(self, _: SdService):
+    def handle_offer_service(self, _: SdService):
         """
         React on an SD offer entry. In a server instance no reaction is needed.
 
@@ -230,7 +278,11 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
         # No reaction in a server instance needed
         pass
 
-    def subscribe_eventgroup_update(
+    def handle_stop_offer_service(self, _: SdService) -> None:
+        # No reaction in a server instance needed
+        pass
+
+    def handle_subscribe_eventgroup(
         self,
         sd_event_group: SdEventGroupEntry,
         ipv4_endpoint_option: SdIPV4EndpointOption,
@@ -302,7 +354,7 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             )
         )
 
-    def subscribe_ack_eventgroup_update(self, _: SdEventGroupEntry) -> None:
+    def handle_subscribe_ack_eventgroup(self, _: SdEventGroupEntry) -> None:
         """
         React on an SD subscribe ACK event group entry. Shall not be received in a server instance. No reaction is needed in a server service instance.
 
@@ -325,13 +377,8 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
         Returns:
             None
         """
-        (
-            session_id,
-            reboot_flag,
-        ) = self._sd_sender.get_multicast_session_handler().update_session()
-
         get_logger(_logger_name).debug(
-            f"Offer service for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X}, TTL: {self._ttl}, version: {self._service.major_version}.{self._service.minor_version}, session ID: {session_id}"
+            f"Offer service for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X}, TTL: {self._ttl}, version: {self._service.major_version}.{self._service.minor_version}"
         )
 
         service_to_offer = SdService(
@@ -343,10 +390,7 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
             endpoint=self._endpoint,
             protocol=self._protocol,
         )
-        sd_header = build_offer_service_sd_header(
-            service_to_offer, session_id, reboot_flag
-        )
-        self._sd_sender.send_multicast(sd_header.to_buffer())
+        self._sd_sender.offer_service(service_to_offer)
 
     def start_offer(self):
         """
@@ -375,18 +419,44 @@ class ServerServiceInstance(ServiceDiscoveryObserver):
 
         Returns:
             None
-
-        TODO:
-            - Send out a stop offer SD message before stopping the timer.
         """
         get_logger(_logger_name).debug(
             f"Stop offer for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X}"
         )
 
+        self._subscribers.clear()
+
         if self._offer_timer is not None:
             self._offer_timer.stop()
             await self._offer_timer.task
-        # TODO: send out a stop offer sd message before stopping the timer
+
+        service_to_stop = SdService(
+            service_id=self._service.id,
+            instance_id=self._instance_id,
+            major_version=1,
+            minor_version=0,
+            ttl=self._ttl,
+            endpoint=self._endpoint,
+            protocol=self._protocol,
+        )
+        (
+            session_id,
+            reboot_flag,
+        ) = self._sd_sender.get_multicast_session_handler().update_session()
+        sd_header = build_stop_offer_service_sd_header(
+            [service_to_stop], session_id, reboot_flag
+        )
+        self._sd_sender.send_multicast(sd_header.to_buffer())
+
+        # Stop processing incoming calls
+        self._is_running = False
+
+        # Cancel all running handler tasks
+        for task in self._handler_tasks:
+            task.cancel()
+
+        # Wait for all tasks to be canceled
+        await asyncio.gather(*self._handler_tasks)
 
 
 async def construct_server_service_instance(

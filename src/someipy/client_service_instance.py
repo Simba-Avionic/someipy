@@ -1,24 +1,25 @@
 # Copyright (C) 2024 Christian H.
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
 from enum import Enum
 import struct
-from typing import Iterable, Tuple, Callable, Set, List
+from typing import Dict, Iterable, Tuple, Callable, Set, List
 
 from someipy import Service
+from someipy._internal.method_result import MethodResult
 from someipy._internal.someip_data_processor import SomeipDataProcessor
 from someipy._internal.someip_sd_header import (
     SdService,
@@ -28,11 +29,12 @@ from someipy._internal.someip_sd_header import (
 from someipy._internal.someip_header import (
     SomeIpHeader,
 )
-from someipy._internal.someip_sd_builder import build_subscribe_eventgroup_entry
+from someipy._internal.someip_sd_builder import build_subscribe_eventgroup_sd_header
 from someipy._internal.service_discovery_abcs import (
     ServiceDiscoveryObserver,
     ServiceDiscoverySender,
 )
+from someipy._internal.store_with_timeout import StoreWithTimeout
 from someipy._internal.utils import (
     create_udp_socket,
     EndpointType,
@@ -40,6 +42,7 @@ from someipy._internal.utils import (
 )
 from someipy._internal.logging import get_logger
 from someipy._internal.message_types import MessageType
+from someipy._internal.return_codes import ReturnCode
 from someipy._internal.someip_endpoint import (
     SomeipEndpoint,
     UDPSomeipEndpoint,
@@ -50,27 +53,12 @@ from someipy._internal.tcp_connection import TcpConnection
 _logger_name = "client_service_instance"
 
 
-class MethodResult(Enum):
-    SUCCESS = 0
-    TIMEOUT = 1
-    SERVICE_NOT_FOUND = 2
-    ERROR = 3
-
-
 class ExpectedAck:
     def __init__(self, eventgroup_id: int) -> None:
         self.eventgroup_id = eventgroup_id
 
-
-class FoundService:
-    service: SdService
-
-    def __init__(self, service: SdService) -> None:
-        self.service = service
-
-    def __eq__(self, __value: object) -> bool:
-        if isinstance(__value, FoundService):
-            return self.service == __value.service
+    def __eq__(self, value: object) -> bool:
+        return self.eventgroup_id == value.eventgroup_id
 
 
 class ClientServiceInstance(ServiceDiscoveryObserver):
@@ -84,9 +72,14 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
 
     _eventgroups_to_subscribe: Set[int]
     _expected_acks: List[ExpectedAck]
+
     _callback: Callable[[bytes], None]
-    _found_services: Iterable[FoundService]
-    _method_call_future: asyncio.Future
+    _offered_services: StoreWithTimeout
+    _subscription_active: bool
+
+    _method_call_futures: Dict[int, asyncio.Future]
+    _client_id: int
+    _session_id: int
 
     def __init__(
         self,
@@ -97,6 +90,7 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
         someip_endpoint: SomeipEndpoint,
         ttl: int = 0,
         sd_sender=None,
+        client_id: int = 0,
     ):
         self._service = service
         self._instance_id = instance_id
@@ -117,8 +111,13 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
         self._tcp_connection_established_event = asyncio.Event()
         self._shutdown_requested = False
 
-        self._found_services = []
-        self._method_call_future = None
+        self._offered_services = StoreWithTimeout()
+
+        self._subscription_active = False
+        self._method_call_futures: Dict[int, asyncio.Future] = {}
+        self._client_id = client_id
+
+        self._session_id = 0  # Starts from 1 to 0xFFFF
 
     def register_callback(self, callback: Callable[[SomeIpMessage], None]) -> None:
         """
@@ -133,42 +132,69 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
         """
         self._callback = callback
 
-    async def call_method(
-        self, method_id: int, payload: bytes
-    ) -> Tuple[MethodResult, bytes]:
-
+    def service_found(self) -> bool:
+        """
+        Returns whether the service instance represented by the ClientServiceInstance has been offered by a server and was found.
+        """
         has_service = False
-        for s in self._found_services:
-            if (
-                s.service.service_id == self._service.id
-                and s.service.instance_id == self._instance_id
-            ):
+        for s in self._offered_services:
+            if s.service_id == self._service.id and s.instance_id == self._instance_id:
                 has_service = True
                 break
+        return has_service
 
-        if not has_service:
-            get_logger(_logger_name).warn(
-                f"Do not execute method call. Service 0x{self._service.id:04X} with instance 0x{self._instance_id:04X} not found."
+    async def call_method(self, method_id: int, payload: bytes) -> MethodResult:
+        """
+        Calls a method on the service instance represented by the ClientServiceInstance.
+
+        Args:
+            method_id (int): The ID of the method to call.
+            payload (bytes): The payload to send with the method call.
+
+        Returns:
+            MethodResult: The result of the method call which can contain an error or a successful result including the response payload.
+
+        Raises:
+            RuntimeError: If the TCP connection to the server cannot be established or if the server service has not been found yet.
+            asyncio.TimeoutError: If the method call times out, i.e. the server does not send back a response within one second.
+        """
+
+        get_logger(_logger_name).debug(f"Try to call method 0x{method_id:04X}")
+
+        if not self.service_found():
+            get_logger(_logger_name).warning(
+                f"Method 0x{method_id:04x} called, but service 0x{self._service.id:04X} with instance 0x{self._instance_id:04X} not found yet."
             )
-            return MethodResult.SERVICE_NOT_FOUND, b""
+            raise RuntimeError(
+                f"Method 0x{method_id:04x} called, but service 0x{self._service.id:04X} with instance 0x{self._instance_id:04X} not found yet."
+            )
+
+        # Session ID is a 16-bit value and should be incremented for each method call starting from 1
+        self._session_id = (self._session_id + 1) % 0xFFFF
+        session_id = self._session_id
 
         header = SomeIpHeader(
             service_id=self._service.id,
             method_id=method_id,
-            client_id=0x00,
-            session_id=0x00,
+            client_id=self._client_id,
+            session_id=session_id,
             protocol_version=0x01,
-            interface_version=0x00,
+            interface_version=self._service.major_version,
             message_type=MessageType.REQUEST.value,
             return_code=0x00,
             length=len(payload) + 8,
         )
         someip_message = SomeIpMessage(header, payload)
 
-        self._method_call_future = asyncio.get_running_loop().create_future()
+        call_future = asyncio.get_running_loop().create_future()
+        self._method_call_futures[session_id] = call_future
 
-        dst_address = str(self._found_services[0].service.endpoint[0])
-        dst_port = self._found_services[0].service.endpoint[1]
+        # At this point the service should be found since an exception would have been raised before
+        for s in self._offered_services:
+            if s.service_id == self._service.id and s.instance_id == self._instance_id:
+                dst_address = str(s.endpoint[0])
+                dst_port = s.endpoint[1]
+                break
 
         if self._protocol == TransportLayerProtocol.TCP:
             # In case of TCP, first try to connect to the TCP server
@@ -189,61 +215,97 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
                 await asyncio.wait_for(self._tcp_connection_established_event.wait(), 2)
             except asyncio.TimeoutError:
                 get_logger(_logger_name).error(
-                    "Could not establish TCP connection for method call."
+                    f"Cannot establish TCP connection to {dst_address}:{dst_port}."
                 )
-                return MethodResult.ERROR, b""
+                raise RuntimeError(
+                    f"Cannot establish TCP connection to {dst_address}:{dst_port}."
+                )
 
             if self._tcp_connection.is_open():
                 self._tcp_connection.writer.write(someip_message.serialize())
             else:
                 get_logger(_logger_name).error(
-                    "TCP connection for method call is not open."
+                    f"TCP connection to {dst_address}:{dst_port} is not opened."
                 )
-                return MethodResult.ERROR, b""
+                raise RuntimeError(
+                    f"TCP connection to {dst_address}:{dst_port} is not opened."
+                )
 
         else:
             # In case of UDP, just send out the datagram and wait for the response
+            # At this point the service should be found since an exception would have been raised before
+            for s in self._offered_services:
+                if (
+                    s.service_id == self._service.id
+                    and s.instance_id == self._instance_id
+                ):
+                    dst_address = str(s.endpoint[0])
+                    dst_port = s.endpoint[1]
+                    break
+
             self._someip_endpoint.sendto(
                 someip_message.serialize(),
-                endpoint_to_str_int_tuple(self._found_services[0].service.endpoint),
+                (dst_address, dst_port),
             )
 
-        # After sending the method call wait for maximum one second
+        # After sending the method call wait for maximum 10 seconds
         try:
-            await asyncio.wait_for(self._method_call_future, 1.0)
+            await asyncio.wait_for(call_future, 10.0)
         except asyncio.TimeoutError:
+
+            # Remove the call_future from self._method_call_futures
+            del self._method_call_futures[session_id]
+
             get_logger(_logger_name).error(
                 f"Waiting on response for method call 0x{method_id:04X} timed out."
             )
-            return MethodResult.TIMEOUT, b""
+            raise
 
-        return MethodResult.SUCCESS, self._method_call_future.result()
+        method_result = call_future.result()
+        del self._method_call_futures[session_id]
+        return method_result
 
     def someip_message_received(
         self, someip_message: SomeIpMessage, addr: Tuple[str, int]
     ) -> None:
+
+        # Handling a notification message
         if (
             someip_message.header.client_id == 0x00
             and someip_message.header.message_type == MessageType.NOTIFICATION.value
-            and someip_message.header.return_code == 0x00
+            and someip_message.header.return_code == ReturnCode.E_OK.value
         ):
-            if self._callback is not None:
+            if self._callback is not None and self._subscription_active:
                 self._callback(someip_message)
-
-        if (
-            someip_message.header.message_type == MessageType.RESPONSE.value
-            and someip_message.header.return_code == 0x00
-        ):  # E_OK
-            if self._method_call_future is not None:
-                self._method_call_future.set_result(someip_message.payload)
                 return
 
+        # Handling a response message
         if (
-            someip_message.header.message_type == MessageType.ERROR.value
-            and someip_message.header.return_code == 0x01
-        ):  # E_NOT_OK
-            if self._method_call_future is not None:
-                self._method_call_future.set_result(b"")
+            someip_message.header.message_type == MessageType.RESPONSE.value
+            or someip_message.header.message_type == MessageType.ERROR.value
+        ):
+            if someip_message.header.session_id not in self._method_call_futures.keys():
+                return
+            if someip_message.header.client_id != self._client_id:
+                return
+
+            call_future = None
+            try:
+                call_future = self._method_call_futures[
+                    someip_message.header.session_id
+                ]
+            except:
+                get_logger(_logger_name).error(
+                    f"Received response for unknown session ID {someip_message.header.session_id}"
+                )
+                return
+
+            if call_future is not None:
+                result = MethodResult()
+                result.message_type = MessageType(someip_message.header.message_type)
+                result.return_code = ReturnCode(someip_message.header.return_code)
+                result.payload = someip_message.payload
+                call_future.set_result(result)
                 return
 
     def subscribe_eventgroup(self, eventgroup_id: int):
@@ -284,71 +346,100 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
         # TODO: Implement StopSubscribe
         raise NotImplementedError
 
-    def find_service_update(self):
+    def handle_find_service(self):
         # Not needed in client service instance
         pass
 
-    def offer_service_update(self, offered_service: SdService):
+    def _timeout_of_offered_service(self, offered_service: SdService):
+        get_logger(_logger_name).debug(
+            f"Offered service timed out: service id 0x{offered_service.service_id:04x}, instance id 0x{offered_service.instance_id:04x}"
+        )
+
+    def handle_offer_service(self, offered_service: SdService):
+        if self._service.id != offered_service.service_id:
+            return
+        if (
+            self._instance_id != 0xFFFF
+            and offered_service.instance_id != 0xFFFF
+            and self._instance_id != offered_service.instance_id
+        ):
+            # 0xFFFF allows to handle any instance ID
+            return
+        if self._service.major_version != offered_service.major_version:
+            return
+        if (
+            self._service.minor_version != 0xFFFFFFFF
+            and self._service.minor_version != offered_service.minor_version
+        ):
+            # 0xFFFFFFFF allows to handle any minor version
+            return
+
+        asyncio.get_event_loop().create_task(
+            self._offered_services.add(
+                offered_service, self._timeout_of_offered_service
+            )
+        )
+
+        if len(self._eventgroups_to_subscribe) == 0:
+            return
+
+        # Try to subscribe to requested event groups
+        for eventgroup_to_subscribe in self._eventgroups_to_subscribe:
+            (
+                session_id,
+                reboot_flag,
+            ) = self._sd_sender.get_unicast_session_handler().update_session()
+            # Improvement: Pack all entries into a single SD message
+            subscribe_sd_header = build_subscribe_eventgroup_sd_header(
+                service_id=self._service.id,
+                instance_id=self._instance_id,
+                major_version=self._service.major_version,
+                ttl=self._ttl,
+                event_group_id=eventgroup_to_subscribe,
+                session_id=session_id,
+                reboot_flag=reboot_flag,
+                endpoint=self._endpoint,
+                protocol=self._protocol,
+            )
+
+            get_logger(_logger_name).debug(
+                f"Send subscribe for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X}, "
+                f"eventgroup ID: {eventgroup_to_subscribe} TTL: {self._ttl}, version: {self._service.major_version}, "
+                f"session ID: {session_id}"
+            )
+
+            if self._protocol == TransportLayerProtocol.TCP:
+                if self._tcp_task is None:
+                    get_logger(_logger_name).debug(
+                        f"Create new TCP task for client of 0x{self._instance_id:04X}, 0x{self._service.id:04X}"
+                    )
+                    self._tcp_task = asyncio.create_task(
+                        self.setup_tcp_connection(
+                            str(self._endpoint[0]),
+                            self._endpoint[1],
+                            str(offered_service.endpoint[0]),
+                            offered_service.endpoint[1],
+                        )
+                    )
+
+            self._expected_acks.append(ExpectedAck(eventgroup_to_subscribe))
+            self._sd_sender.send_unicast(
+                buffer=subscribe_sd_header.to_buffer(),
+                dest_ip=offered_service.endpoint[0],
+            )
+
+    def handle_stop_offer_service(self, offered_service: SdService) -> None:
         if self._service.id != offered_service.service_id:
             return
         if self._instance_id != offered_service.instance_id:
             return
 
-        if (
-            offered_service.service_id == self._service.id
-            and offered_service.instance_id == self._instance_id
-        ):
-            if FoundService(offered_service) not in self._found_services:
-                self._found_services.append(FoundService(offered_service))
+        asyncio.get_event_loop().create_task(
+            self._offered_services.remove(offered_service)
+        )
 
-            if len(self._eventgroups_to_subscribe) == 0:
-                return
-
-            # Try to subscribe to requested event groups
-            for eventgroup_to_subscribe in self._eventgroups_to_subscribe:
-                (
-                    session_id,
-                    reboot_flag,
-                ) = self._sd_sender.get_unicast_session_handler().update_session()
-
-                # Improvement: Pack all entries into a single SD message
-                subscribe_sd_header = build_subscribe_eventgroup_entry(
-                    service_id=self._service.id,
-                    instance_id=self._instance_id,
-                    major_version=self._service.major_version,
-                    ttl=self._ttl,
-                    event_group_id=eventgroup_to_subscribe,
-                    session_id=session_id,
-                    reboot_flag=reboot_flag,
-                    endpoint=self._endpoint,
-                    protocol=self._protocol,
-                )
-
-                get_logger(_logger_name).debug(
-                    f"Send subscribe for instance 0x{self._instance_id:04X}, service: 0x{self._service.id:04X}, "
-                    f"eventgroup ID: {eventgroup_to_subscribe} TTL: {self._ttl}, version: "
-                    f"session ID: {session_id}"
-                )
-
-                if self._protocol == TransportLayerProtocol.TCP:
-                    if self._tcp_task is None:
-                        get_logger(_logger_name).debug(
-                            f"Create new TCP task for client of 0x{self._instance_id:04X}, 0x{self._service.id:04X}"
-                        )
-                        self._tcp_task = asyncio.create_task(
-                            self.setup_tcp_connection(
-                                str(self._endpoint[0]),
-                                self._endpoint[1],
-                                str(offered_service.endpoint[0]),
-                                offered_service.endpoint[1],
-                            )
-                        )
-
-                self._expected_acks.append(ExpectedAck(eventgroup_to_subscribe))
-                self._sd_sender.send_unicast(
-                    buffer=subscribe_sd_header.to_buffer(),
-                    dest_ip=offered_service.endpoint[0],
-                )
+        self._expected_acks = []
+        self._subscription_active = False
 
     async def setup_tcp_connection(
         self, src_ip: str, src_port: int, dst_ip: str, dst_port: int
@@ -410,11 +501,11 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
             get_logger(_logger_name).debug("TCP task is cancelled. Raise again.")
             raise
 
-    def subscribe_eventgroup_update(self, _, __) -> None:
+    def handle_subscribe_eventgroup(self, _, __) -> None:
         # Not needed for client instance
         pass
 
-    def subscribe_ack_eventgroup_update(
+    def handle_subscribe_ack_eventgroup(
         self, event_group_entry: SdEventGroupEntry
     ) -> None:
         new_acks: List[ExpectedAck] = []
@@ -422,6 +513,7 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
         for expected_ack in self._expected_acks:
             if expected_ack.eventgroup_id == event_group_entry.eventgroup_id:
                 ack_found = True
+                self._subscription_active = True
                 get_logger(_logger_name).debug(
                     f"Received expected subscribe ACK for instance 0x{event_group_entry.sd_entry.instance_id:04X}, service 0x{event_group_entry.sd_entry.service_id:04X}, eventgroup 0x{event_group_entry.eventgroup_id:04X}"
                 )
@@ -430,7 +522,7 @@ class ClientServiceInstance(ServiceDiscoveryObserver):
 
         self._expected_acks = new_acks
         if not ack_found:
-            get_logger(_logger_name).warn(
+            get_logger(_logger_name).warning(
                 f"Received unexpected subscribe ACK for instance 0x{event_group_entry.sd_entry.instance_id:04X}, service 0x{event_group_entry.sd_entry.service_id:04X}, eventgroup 0x{event_group_entry.eventgroup_id:04X}"
             )
 
@@ -451,6 +543,7 @@ async def construct_client_service_instance(
     ttl: int = 0,
     sd_sender=None,
     protocol=TransportLayerProtocol.UDP,
+    client_id: int = 0,
 ) -> ClientServiceInstance:
     """
     Asynchronously constructs a ClientServerInstance. Based on the given transport protocol, proper endpoints are setup before constructing the actual ServerServiceInstance.
@@ -485,6 +578,7 @@ async def construct_client_service_instance(
             udp_endpoint,
             ttl,
             sd_sender,
+            client_id,
         )
 
         udp_endpoint.set_someip_callback(client_instance.someip_message_received)
