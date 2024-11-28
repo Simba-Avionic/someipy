@@ -10,3 +10,7 @@ integration_tests/build
 integration_tests/install
 
 build/
+bazel-bin
+bazel-out
+bazel-someipy
+bazel-testlogs
