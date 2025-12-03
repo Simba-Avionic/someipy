@@ -64,7 +64,7 @@ class Uint8:
         Returns:
             bytes: The serialized value of the object.
         """
-        return struct.pack(">B", self.value)
+        return struct.pack("<B", self.value)
 
     def deserialize(self, payload):
         """
@@ -76,7 +76,7 @@ class Uint8:
         Returns:
             None
         """
-        (self.value,) = struct.unpack(">B", payload)
+        (self.value,) = struct.unpack("<B", payload)
         return self
 
 
@@ -144,7 +144,7 @@ class Uint16:
         Returns:
             bytes: The serialized value of the object.
         """
-        return struct.pack(">H", self.value)
+        return struct.pack("<H", self.value)
 
     def deserialize(self, payload):
         """
@@ -156,7 +156,7 @@ class Uint16:
         Returns:
             self: The deserialized object.
         """
-        (self.value,) = struct.unpack(">H", payload)
+        (self.value,) = struct.unpack("<H", payload)
         return self
 
 
@@ -212,10 +212,10 @@ class Uint32:
         return 4
 
     def serialize(self) -> bytes:
-        return struct.pack(">L", self.value)
+        return struct.pack("<L", self.value)
 
     def deserialize(self, payload):
-        (self.value,) = struct.unpack(">L", payload)
+        (self.value,) = struct.unpack("<L", payload)
         return self
 
 
@@ -300,7 +300,7 @@ class Bool:
         Returns:
             bytes: The serialized value of the object.
         """
-        return struct.pack(">B", int(self.value))
+        return struct.pack("<B", int(self.value))
 
     def deserialize(self, payload):
         """
@@ -314,7 +314,7 @@ class Bool:
 
         This method deserializes the payload into the value of the object. It expects the payload to be a single byte representing a boolean value. If the payload is 0, the value of the object is set to False. If the payload is 1, the value of the object is set to True. The deserialized object is then returned.
         """
-        (int_value,) = struct.unpack(">B", payload)
+        (int_value,) = struct.unpack("<B", payload)
         if int_value == 0:
             self.value = False
         elif int_value == 1:
@@ -720,11 +720,11 @@ class SomeIpDynamicSizeArray(Generic[T]):
         result = bytes()
         length_data_in_bytes = len(self.data) * self._single_element_length
         if self._length_field_length == 1:
-            result += struct.pack(">B", length_data_in_bytes)
+            result += struct.pack("<B", length_data_in_bytes)
         elif self._length_field_length == 2:
-            result += struct.pack(">H", length_data_in_bytes)
+            result += struct.pack("<H", length_data_in_bytes)
         elif self._length_field_length == 4:
-            result += struct.pack(">L", length_data_in_bytes)
+            result += struct.pack("<L", length_data_in_bytes)
 
         for element in self.data:
             result += element.serialize()
@@ -747,11 +747,11 @@ class SomeIpDynamicSizeArray(Generic[T]):
         length = 0
 
         if self._length_field_length == 1:
-            (length,) = struct.unpack(">B", payload[:1])
+            (length,) = struct.unpack("<B", payload[:1])
         elif self._length_field_length == 2:
-            (length,) = struct.unpack(">H", payload[:2])
+            (length,) = struct.unpack("<H", payload[:2])
         elif self._length_field_length == 4:
-            (length,) = struct.unpack(">L", payload[:4])
+            (length,) = struct.unpack("<L", payload[:4])
         else:
             return
 
@@ -1054,19 +1054,19 @@ class SomeIpDynamicSizeString(Generic[T]):
                 raise ValueError(
                     "Length of the string exceeds maximum value of 255 for 1 byte length field."
                 )
-            result += struct.pack(">B", length)
+            result += struct.pack("<B", length)
         elif self.length_field_length == 2:
             if length > 65535:
                 raise ValueError(
                     "Length of the string exceeds maximum value of 65535 for 2 byte length field."
                 )
-            result += struct.pack(">H", length)
+            result += struct.pack("<H", length)
         elif self.length_field_length == 4:
             if length > 4294967295:
                 raise ValueError(
                     "Length of the string exceeds maximum value of 4294967295 for 4 byte length field."
                 )
-            result += struct.pack(">L", length)
+            result += struct.pack("<L", length)
 
         result += bom
         result += encoded_str
@@ -1095,11 +1095,11 @@ class SomeIpDynamicSizeString(Generic[T]):
 
         length_field = payload[: self.length_field_length]
         if self.length_field_length == 1:
-            (length,) = struct.unpack(">B", length_field)
+            (length,) = struct.unpack("<B", length_field)
         elif self.length_field_length == 2:
-            (length,) = struct.unpack(">H", length_field)
+            (length,) = struct.unpack("<H", length_field)
         elif self.length_field_length == 4:
-            (length,) = struct.unpack(">L", length_field)
+            (length,) = struct.unpack("<L", length_field)
 
         if len(payload) < length:
             raise ValueError(
