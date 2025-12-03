@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-
 import pytest
 from someipy.serialization import (
     Uint8,
@@ -26,12 +25,10 @@ def test_base_types_len():
     assert 2 == len(Uint16(1))
     assert 4 == len(Uint32(1))
     assert 8 == len(Uint64(1))
-
     assert 1 == len(Sint8(-1))
     assert 2 == len(Sint16(-1))
     assert 4 == len(Sint32(-1))
     assert 8 == len(Sint64(-1))
-
     assert 1 == len(Bool(True))
     assert 4 == len(Float32(1.0))
     assert 8 == len(Float64(1.0))
@@ -39,15 +36,9 @@ def test_base_types_len():
 
 @dataclass
 class MsgBaseTypesOnly(SomeIpPayload):
-    """
-    The dataclass decorator will generate an __eq__ method which
-    can be used for comparing the content of two messages
-    """
-
-    # Expected 13 bytes in total
-    x: Uint8  # 1 byte
-    y: Uint32  # 4 bytes
-    z: Float64  # 8 bytes
+    x: Uint8
+    y: Uint32
+    z: Float64
 
     def __init__(self):
         self.x = Uint8(0)
@@ -57,7 +48,6 @@ class MsgBaseTypesOnly(SomeIpPayload):
 
 @dataclass
 class MsgWithOneStruct(SomeIpPayload):
-    # Expected 1 + 13 + 4 bytes in total
     a: Uint8
     b: MsgBaseTypesOnly
     c: Sint32
@@ -77,10 +67,8 @@ def test_struct_equals_operator():
     m_1 = MsgBaseTypesOnly()
     m_2 = MsgBaseTypesOnly()
     assert m_1 == m_2
-
     m_1.x = Uint8(1)
     assert m_1 != m_2
-
     m_2.x = Uint8(1)
     assert m_1 == m_2
 
@@ -88,21 +76,18 @@ def test_struct_equals_operator():
 def test_struct_serialization_and_deserialization():
     m = MsgBaseTypesOnly()
     m.y = Uint32(4)
-    # Expected: 0x 00 00000004 0000000000000000
-    assert bytes.fromhex("00000000040000000000000000") == m.serialize()
+    assert bytes.fromhex("00040000000000000000000000") == m.serialize()
 
     m.x = Uint8(255)
-    # Expected: 0x FF 00000004 0000000000000000
-    assert bytes.fromhex("ff000000040000000000000000") == m.serialize()
+    assert bytes.fromhex("ff040000000000000000000000") == m.serialize()
 
     m_again = MsgBaseTypesOnly().deserialize(
-        bytes.fromhex("ff000000040000000000000000")
+        bytes.fromhex("ff040000000000000000000000")
     )
     assert m_again == m
 
-    # The first byte is changed now to decimal 254
     m_different = MsgBaseTypesOnly().deserialize(
-        bytes.fromhex("fe000000040000000000000000")
+        bytes.fromhex("fe040000000000000000000000")
     )
     assert m_different != m_again
     assert m_different != m
@@ -118,36 +103,28 @@ def test_fixed_size_array_equals_operator():
     a = SomeIpFixedSizeArray(Uint16, 10)
     b = SomeIpFixedSizeArray(Uint16, 10)
     assert a == b
-
     c = SomeIpFixedSizeArray(Uint8, 10)
     assert a != c
-
     a.data[0] = Uint16(5)
     assert a != b
-
     b.data[0] = Uint16(5)
     assert a == b
 
 
 def test_fixed_size_array_serialization_and_deserialization():
     a = SomeIpFixedSizeArray(Uint8, 4)
-    # Expected hex: 0x 00 00 00 00
     assert bytes.fromhex("00000000") == a.serialize()
-
     a.data[0] = Uint8(1)
     a.data[1] = Uint8(2)
     a.data[2] = Uint8(3)
     a.data[3] = Uint8(4)
-    # Expected hex: 0x 01 02 03 04
     assert bytes.fromhex("01020304") == a.serialize()
-
     a_again = SomeIpFixedSizeArray(Uint8, 4).deserialize(bytes.fromhex("01020304"))
     assert a_again == a
 
 
 def test_dynamic_size_array_length():
     a = SomeIpDynamicSizeArray(Uint16)
-
     assert len(a) == a.length_field_length
     e = Uint16(1)
     a.data.append(e)
@@ -156,23 +133,21 @@ def test_dynamic_size_array_length():
     assert len(a) == a.length_field_length
 
     a.length_field_length = 2
-    # Except only the length field with 2 bytes to be serialized and no data
     assert bytes.fromhex("0000") == a.serialize()
 
     a.length_field_length = 4
-    # Except only the length field with 4 bytes to be serialized and no data
     assert bytes.fromhex("00000000") == a.serialize()
 
     a.data.append(Uint16(1))
-    assert bytes.fromhex("000000020001") == a.serialize()
+    assert bytes.fromhex("020000000100") == a.serialize()
 
     a.data.append(Uint16(4))
     assert len(a) == 2 * len(Uint16()) + a.length_field_length
-    assert bytes.fromhex("0000000400010004") == a.serialize()
+    assert bytes.fromhex("0400000001000400") == a.serialize()
 
     b = SomeIpDynamicSizeArray(Uint16)
     b.length_field_length = 4
-    b = b.deserialize(bytes.fromhex("0000000400010004"))
+    b = b.deserialize(bytes.fromhex("0400000001000400"))
     assert b == a
     assert b.data[0] == Uint16(1)
     assert b.data[1] == Uint16(4)
@@ -185,7 +160,6 @@ def test_someip_fixed_size_string():
     assert a.data == ""
     assert a.encoding == "utf-8"
     assert len(a) == 4 + 3
-
     with pytest.raises(ValueError):
         a.data = "Hello World"
     with pytest.raises(ValueError):
@@ -198,7 +172,6 @@ def test_someip_fixed_size_string():
     b = SomeIpFixedSizeString(4)
     b.data = "He"
     assert a == b
-
     assert bytes.fromhex("EF BB BF 48 65 00 00") == a.serialize()
 
     a.encoding = "utf-16le"
@@ -232,7 +205,6 @@ def test_someip_dynamic_size_string():
     assert a.length_field_length == 4
     assert a._length_field_value == 4
     assert len(a) == 4 + 3 + 1
-
     with pytest.raises(ValueError):
         a.encoding = "Hello World"
     with pytest.raises(ValueError):
@@ -241,41 +213,39 @@ def test_someip_dynamic_size_string():
     a.data = "He"
     a.encoding = "utf-8"
     assert len(a) == 4 + 3 + 2 + 1
-    # 4 bytes for the length field, 3 bytes BOM and 3 bytes for the data including '\0'
-    assert bytes.fromhex("00 00 00 06 EF BB BF 48 65 00") == a.serialize()
+    assert bytes.fromhex("06 00 00 00 EF BB BF 48 65 00") == a.serialize()
 
     a.encoding = "utf-16le"
     assert len(a) == 4 + 2 + 2 * 2 + 2
-    assert bytes.fromhex("00 00 00 08 FF FE 48 00 65 00 00 00") == a.serialize()
+    assert bytes.fromhex("08 00 00 00 FF FE 48 00 65 00 00 00") == a.serialize()
 
     a.encoding = "utf-16be"
     assert len(a) == 4 + 2 + 2 * 2 + 2
-    assert bytes.fromhex("00 00 00 08 FE FF 00 48 00 65 00 00") == a.serialize()
+    assert bytes.fromhex("08 00 00 00 FE FF 00 48 00 65 00 00") == a.serialize()
 
     a.encoding = "utf-8"
     a.length_field_length = 2
     assert len(a) == 2 + 3 + 2 + 1
-    # 2 bytes for the length field, 3 bytes BOM and 3 bytes for the data including '\0'
-    assert bytes.fromhex("00 06 EF BB BF 48 65 00") == a.serialize()
+    assert bytes.fromhex("06 00 EF BB BF 48 65 00") == a.serialize()
 
     b = SomeIpDynamicSizeString()
     b.encoding = "utf-16be"
     b.length_field_length = 4
-    b = b.deserialize(bytes.fromhex("00 00 00 09 EF BB BF 48 65 00 00 00 00"))
+    b = b.deserialize(bytes.fromhex("09 00 00 00 EF BB BF 48 65 00 00 00 00"))
     assert len(b) == 13
     assert b.encoding == "utf-8"
     assert b.data == "He"
 
-    b = b.deserialize(bytes.fromhex("00 00 00 0A FF FE 48 00 65 00 00 00 00 00"))
+    b = b.deserialize(bytes.fromhex("0A 00 00 00 FF FE 48 00 65 00 00 00 00 00"))
     assert b.encoding == "utf-16le"
     assert b.data == "He"
 
-    b = b.deserialize(bytes.fromhex("00 00 00 0A FE FF 00 48 00 65 00 00 00 00"))
+    b = b.deserialize(bytes.fromhex("0A 00 00 00 FE FF 00 48 00 65 00 00 00 00"))
     assert b.encoding == "utf-16be"
     assert b.data == "He"
 
     b.length_field_length = 2
-    b = b.deserialize(bytes.fromhex("00 0A FE FF 00 48 00 65 00 00 00 00"))
+    b = b.deserialize(bytes.fromhex("0A 00 FE FF 00 48 00 65 00 00 00 00"))
     assert b.encoding == "utf-16be"
     assert b.data == "He"
 
@@ -292,26 +262,26 @@ class MsgWithStrings(SomeIpPayload):
         self.c = Uint32(5)
 
 
-def test_struct_with_dynamic_sized_types():
+def test_struct_with_dynamic_sized_types_1():
     a = MsgWithStrings()
     assert len(a) == len(Uint16()) + len(SomeIpDynamicSizeString("123")) + len(Uint32())
     assert len(a) == 2 + 4 + 3 + 3 + 1 + 4
     assert len(a.serialize()) == len(a)
 
     assert (
-        bytes.fromhex("00 0A 00 00 00 07 EF BB BF 31 32 33 00 00 00 00 05")
-        == a.serialize()
+            bytes.fromhex("0A 00 07 00 00 00 EF BB BF 31 32 33 00 05 00 00 00")
+            == a.serialize()
     )
 
     a.b = SomeIpDynamicSizeString("1234")
     assert len(a) == 2 + 4 + 3 + 3 + 1 + 4 + 1
     assert (
-        bytes.fromhex("00 0A 00 00 00 08 EF BB BF 31 32 33 34 00 00 00 00 05")
-        == a.serialize()
+            bytes.fromhex("0A 00 08 00 00 00 EF BB BF 31 32 33 34 00 05 00 00 00")
+            == a.serialize()
     )
 
     b = MsgWithStrings().deserialize(
-        bytes.fromhex("00 0A 00 00 00 08 EF BB BF 31 32 33 34 00 00 00 00 05")
+        bytes.fromhex("0A 00 08 00 00 00 EF BB BF 31 32 33 34 00 05 00 00 00")
     )
     assert b.a == Uint16(10)
     assert b.b == SomeIpDynamicSizeString("1234")
@@ -333,26 +303,25 @@ class MsgWithTwoStrings(SomeIpPayload):
         self.d = Uint32(5)
 
 
-def test_struct_with_dynamic_sized_types():
+def test_struct_with_dynamic_sized_types_2():
     a = MsgWithTwoStrings()
     assert len(a) == 2 + 4 + 3 + 3 + 1 + 4 + 2 + 4 * 2 + 2 + 4
     assert len(a.serialize()) == len(a)
 
     assert (
-        bytes.fromhex(
-            "00 0A 00 00 00 07 EF BB BF 31 32 33 00 00 00 00 0C FE FF 00 34 00 33 00 32 00 31 00 00 00 00 00 05"
-        )
-        == a.serialize()
+            bytes.fromhex(
+                "0A 00 07 00 00 00 EF BB BF 31 32 33 00 0C 00 00 00 FE FF 00 34 00 33 00 32 00 31 00 00 05 00 00 00"
+            )
+            == a.serialize()
     )
 
     b = MsgWithTwoStrings().deserialize(
         bytes.fromhex(
-            "00 0A 00 00 00 07 EF BB BF 31 32 33 00 00 00 00 0C FE FF 00 34 00 33 00 32 00 31 00 00 00 00 00 05"
+            "0A 00 07 00 00 00 EF BB BF 31 32 33 00 0C 00 00 00 FE FF 00 34 00 33 00 32 00 31 00 00 05 00 00 00"
         )
     )
     assert b.a == Uint16(10)
     assert b.b == SomeIpDynamicSizeString("123")
-
     c = SomeIpDynamicSizeString("4321")
     c.encoding = "utf-16be"
     assert b.c == c
@@ -377,18 +346,19 @@ def test_struct_with_dynamic_arrays():
     a = MsgWithDynamicArrays()
     assert len(a) == 2 + 4 + 4 + 4
     assert len(a.serialize()) == len(a)
-    assert bytes.fromhex("00 0A 00 00 00 00 00 00 00 05 00 00 00 00") == a.serialize()
+
+    assert bytes.fromhex("0A 00 00 00 00 00 05 00 00 00 00 00 00 00") == a.serialize()
 
     a.b.data.append(Uint8(1))
     assert len(a.serialize()) == len(a)
+
     assert (
-        bytes.fromhex("00 0A 00 00 00 01 01 00 00 00 05 00 00 00 00") == a.serialize()
+            bytes.fromhex("0A 00 01 00 00 00 01 05 00 00 00 00 00 00 00") == a.serialize()
     )
 
     b = MsgWithDynamicArrays().deserialize(
-        bytes.fromhex("00 0A 00 00 00 01 01 00 00 00 05 00 00 00 00")
+        bytes.fromhex("0A 00 01 00 00 00 01 05 00 00 00 00 00 00 00")
     )
-
     assert b.a == Uint16(10)
     assert b.b.data[0] == Uint8(1)
     assert b.c == Uint32(5)
