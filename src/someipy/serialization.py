@@ -196,7 +196,7 @@ class Sint16:
         Returns:
             self: The deserialized object.
         """
-        (self.value,) = struct.unpack(">h", payload)
+        (self.value,) = struct.unpack("<h", payload)
         return self
 
 
